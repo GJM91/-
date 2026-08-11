@@ -36,6 +36,7 @@ import os
 import csv
 import json
 import math
+import time
 import urllib.parse
 import urllib.request
 
@@ -73,7 +74,8 @@ MAX_TILES = 4000
 #  V-World NED API. 지적도의 PNU 로 한 필지씩 조회하여 속성을 붙입니다.
 #  (요청주소: https://api.vworld.kr/ned/data/ladfrlList , pnu 필수)
 LADFRL_URL = "https://api.vworld.kr/ned/data/ladfrlList"
-#  PNU 개수가 이 값을 넘으면 구역계(대상지) 필지만 API 조회(넓은 영역은 CSV 권장)
+#  PNU 개수가 이 값을 넘으면 "시간이 걸릴 수 있음"만 안내(조회는 전체 진행).
+#  ※ 더 이상 조회 대상을 줄이지 않습니다 — 2km 포함 전체 필지에 조인합니다.
 LADFRL_MAX_PNU = 6000
 
 # 광역(구역계+2km) 레이어도 사각형으로 잘라낼지 여부
@@ -451,60 +453,111 @@ def _extract_records(obj):
     return found[0] if found else []
 
 
-def fetch_ladfrl(pnu):
-    """PNU 한 개의 토지임야정보(최신연도) dict 반환. 없으면 None."""
-    params = {
-        "pnu": pnu, "format": "json",
-        "numOfRows": 50, "pageNo": 1,
-        "key": VWORLD_KEY, "domain": VWORLD_DOMAIN,
-    }
-    url = LADFRL_URL + "?" + urllib.parse.urlencode(params)
-    try:
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except Exception:
-        return None
-    recs = _extract_records(data)
-    if not recs:
-        return None
+def _rec_pnu(rec):
+    """레코드(dict)에서 PNU 값 추출."""
+    for k in ("pnu", "PNU", "고유번호", "필지고유번호"):
+        v = rec.get(k)
+        if v not in (None, ""):
+            return str(v).strip()
+    return None
 
-    def year_of(rec):
-        for k in ("stdrYear", "STDR_YEAR", "standardYear", "lastUpdtDt"):
-            v = rec.get(k)
-            if v:
-                try:
-                    return int(str(v)[:4])
-                except Exception:
-                    return 0
-        return 0
 
-    return sorted(recs, key=year_of)[-1]   # 최신 연도 레코드
+def _rec_year(rec):
+    for k in ("stdrYear", "STDR_YEAR", "standardYear", "lastUpdtDt"):
+        v = rec.get(k)
+        if v:
+            try:
+                return int(str(v)[:4])
+            except Exception:
+                return 0
+    return 0
+
+
+def fetch_ladfrl_list(pnu_value, max_pages=50):
+    """ladfrlList 를 페이징으로 조회하여 레코드 목록 반환.
+       pnu_value 는 전체 PNU(19자리) 또는 법정동코드 접두(10자리)일 수 있음.
+       반환: (records, status)  status='OK'|'NETERR'"""
+    out = []
+    for page in range(1, max_pages + 1):
+        params = {
+            "pnu": pnu_value, "format": "json",
+            "numOfRows": 1000, "pageNo": page,
+            "key": VWORLD_KEY, "domain": VWORLD_DOMAIN,
+        }
+        url = LADFRL_URL + "?" + urllib.parse.urlencode(params)
+        try:
+            with urllib.request.urlopen(url, timeout=40) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            return out, "NETERR"
+        recs = _extract_records(data)
+        if not recs:
+            break
+        out.extend(recs)
+        if len(recs) < 1000:
+            break
+    return out, "OK"
 
 
 def build_ladfrl_index(pnus):
-    """여러 PNU 를 V-World API 로 조회 → (columns, index).
+    """토지임야정보를 V-World API 로 조회 → (columns, index).
+       ① 법정동코드(앞 10자리) 단위로 묶어 조회(지원 시 훨씬 빠름)
+       ② 그래도 안 붙은 필지는 PNU 개별 조회(재시도 포함)로 보완 → 전체 필지 커버.
        columns = PNU 제외 속성 컬럼명 목록, index[pnu] = {col: val}."""
-    uniq = sorted({p for p in pnus if p})
-    total = len(uniq)
-    log(f"     토지임야정보를 V-World API 로 조회합니다 (필지 {total}개)...")
-    index = {}
-    cols = []
-    seen = set()
-    for i, p in enumerate(uniq, 1):
-        rec = fetch_ladfrl(p)
-        if rec:
-            clean = {}
-            for k, v in rec.items():
-                if k.strip().lower() == "pnu" or "고유번호" in k:
-                    continue
-                clean[k] = "" if v is None else str(v)
-                if k not in seen:
-                    seen.add(k)
-                    cols.append(k)
-            index[p] = clean
-        if i % 50 == 0 or i == total:
-            log(f"       진행 {i}/{total} · 매칭 {len(index)}필지")
-    log(f"     ⇒ 토지임야 API 조회 완료: {len(index)}/{total} 필지, 속성열 {len(cols)}개")
+    target = {p for p in pnus if p}
+    total = len(target)
+    log(f"     토지임야정보 API 조회 대상 필지: {total}개")
+    index, yearmap = {}, {}
+    cols, seen = [], set()
+
+    def absorb(rec):
+        key = _rec_pnu(rec)
+        if not key or key not in target:
+            return
+        y = _rec_year(rec)
+        if key in index and y <= yearmap.get(key, -1):
+            return   # 이미 더 최신(또는 동일) 연도 보유
+        yearmap[key] = y
+        clean = {}
+        for k, v in rec.items():
+            if k.strip().lower() == "pnu" or "고유번호" in k:
+                continue
+            clean[k] = "" if v is None else str(v)
+            if k not in seen:
+                seen.add(k)
+                cols.append(k)
+        index[key] = clean
+
+    # ① 법정동 단위 묶음 조회
+    ldcodes = sorted({p[:10] for p in target if len(p) >= 10})
+    if ldcodes:
+        log(f"     [1차] 법정동 {len(ldcodes)}곳 묶음 조회...")
+        for i, lc in enumerate(ldcodes, 1):
+            recs, _ = fetch_ladfrl_list(lc)
+            for r in recs:
+                absorb(r)
+            if i % 10 == 0 or i == len(ldcodes):
+                log(f"       진행 {i}/{len(ldcodes)} 법정동 · 누적 {len(index)}/{total}")
+
+    # ② 남은 필지 개별 조회(재시도)
+    missing = [p for p in sorted(target) if p not in index]
+    if missing:
+        log(f"     [2차] 개별 조회 필지: {len(missing)}개...")
+        for i, p in enumerate(missing, 1):
+            recs, st = fetch_ladfrl_list(p, max_pages=3)
+            attempt = 1
+            while not recs and st == "NETERR" and attempt < 3:
+                time.sleep(0.5 * attempt)
+                attempt += 1
+                recs, st = fetch_ladfrl_list(p, max_pages=3)
+            for r in recs:
+                absorb(r)
+            if i % 50 == 0 or i == len(missing):
+                log(f"       진행 {i}/{len(missing)} · 누적 {len(index)}/{total}")
+
+    still = total - len(index)
+    log(f"     ⇒ 토지임야 조인 준비: {len(index)}/{total} 필지 매칭"
+        f"{f', 미매칭 {still}개' if still else ''}, 속성열 {len(cols)}개")
     return cols, index
 
 
@@ -699,12 +752,11 @@ def main():
 
         columns = index = None
         if ok and choice.startswith("V-World API"):
-            target = wide_pnus
+            # 항상 전체(2km 포함) 필지에 조인. 필지가 많으면 시간 안내만 하고 진행.
             if len(wide_pnus) > LADFRL_MAX_PNU:
-                log(f"     ⚠ PNU {len(wide_pnus)}개 > 상한 {LADFRL_MAX_PNU} "
-                    f"→ 구역계 {len(narrow_pnus)}필지만 API 조회(넓은 영역은 CSV 권장)")
-                target = narrow_pnus
-            columns, index = build_ladfrl_index(target)
+                log(f"     ⚠ 필지 {len(wide_pnus)}개 → API 호출이 많아 시간이 걸릴 수 "
+                    f"있습니다(넓은 영역은 CSV 방식이 더 빠름). 전체를 조회합니다.")
+            columns, index = build_ladfrl_index(wide_pnus)
         elif ok and choice.startswith("CSV"):
             columns, index, _ = load_land_csv(wide_pnus)
         else:
