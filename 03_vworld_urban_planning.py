@@ -69,6 +69,13 @@ MAX_PAGES = 1000
 TILE_M = 700
 MAX_TILES = 4000
 
+# 토지임야정보 (국가중점데이터API > 부동산 개방데이터 > 토지임야정보)
+#  V-World NED API. 지적도의 PNU 로 한 필지씩 조회하여 속성을 붙입니다.
+#  (요청주소: https://api.vworld.kr/ned/data/ladfrlList , pnu 필수)
+LADFRL_URL = "https://api.vworld.kr/ned/data/ladfrlList"
+#  PNU 개수가 이 값을 넘으면 구역계(대상지) 필지만 API 조회(넓은 영역은 CSV 권장)
+LADFRL_MAX_PNU = 6000
+
 # 광역(구역계+2km) 레이어도 사각형으로 잘라낼지 여부
 #  True  : 2km 사각형 경계에서 폴리곤을 잘라냄(요청대로 "사각형"으로)
 #  False : 사각형에 걸치는 필지/구역을 자르지 않고 통째로 표시
@@ -421,27 +428,108 @@ def load_land_csv(needed_pnus=None):
 
 
 # ─────────────────────────────────────────────────────────────
+# 5-B) 토지임야정보 V-World API 조회 (PNU → 속성 dict)
+#      국가중점데이터API > 부동산 개방데이터 > 토지임야정보 (ladfrlList)
+#      → CSV 다운로드 없이 지적도의 PNU 로 바로 조회하여 붙입니다.
+# ─────────────────────────────────────────────────────────────
+def _extract_records(obj):
+    """NED API 응답(JSON) 안에서 '레코드(dict) 목록'을 찾아 반환."""
+    found = []
+
+    def walk(o):
+        if isinstance(o, list):
+            if o and all(isinstance(x, dict) for x in o):
+                found.append(o)
+            else:
+                for x in o:
+                    walk(x)
+        elif isinstance(o, dict):
+            for v in o.values():
+                walk(v)
+
+    walk(obj)
+    return found[0] if found else []
+
+
+def fetch_ladfrl(pnu):
+    """PNU 한 개의 토지임야정보(최신연도) dict 반환. 없으면 None."""
+    params = {
+        "pnu": pnu, "format": "json",
+        "numOfRows": 50, "pageNo": 1,
+        "key": VWORLD_KEY, "domain": VWORLD_DOMAIN,
+    }
+    url = LADFRL_URL + "?" + urllib.parse.urlencode(params)
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+    recs = _extract_records(data)
+    if not recs:
+        return None
+
+    def year_of(rec):
+        for k in ("stdrYear", "STDR_YEAR", "standardYear", "lastUpdtDt"):
+            v = rec.get(k)
+            if v:
+                try:
+                    return int(str(v)[:4])
+                except Exception:
+                    return 0
+        return 0
+
+    return sorted(recs, key=year_of)[-1]   # 최신 연도 레코드
+
+
+def build_ladfrl_index(pnus):
+    """여러 PNU 를 V-World API 로 조회 → (columns, index).
+       columns = PNU 제외 속성 컬럼명 목록, index[pnu] = {col: val}."""
+    uniq = sorted({p for p in pnus if p})
+    total = len(uniq)
+    log(f"     토지임야정보를 V-World API 로 조회합니다 (필지 {total}개)...")
+    index = {}
+    cols = []
+    seen = set()
+    for i, p in enumerate(uniq, 1):
+        rec = fetch_ladfrl(p)
+        if rec:
+            clean = {}
+            for k, v in rec.items():
+                if k.strip().lower() == "pnu" or "고유번호" in k:
+                    continue
+                clean[k] = "" if v is None else str(v)
+                if k not in seen:
+                    seen.add(k)
+                    cols.append(k)
+            index[p] = clean
+        if i % 50 == 0 or i == total:
+            log(f"       진행 {i}/{total} · 매칭 {len(index)}필지")
+    log(f"     ⇒ 토지임야 API 조회 완료: {len(index)}/{total} 필지, 속성열 {len(cols)}개")
+    return cols, index
+
+
+# ─────────────────────────────────────────────────────────────
 # 6) 지적도 레이어에 토지임야정보 조인 (PNU 기준)
 # ─────────────────────────────────────────────────────────────
+def _layer_pnu_field(layer):
+    """레이어 필드 중 PNU(필지고유번호) 필드명을 찾아 반환(없으면 None)."""
+    field_names = [f.name() for f in layer.fields()]
+    for key in PNU_KEYS:
+        for fn in field_names:
+            if fn.strip().lower() == key.lower():
+                return fn
+    for fn in field_names:
+        if "pnu" in fn.lower() or "고유번호" in fn:
+            return fn
+    return None
+
+
 def join_land_info(cadastral_layer, columns, index):
     if not columns or not index:
         return 0
 
-    # 지적도 PNU 필드 찾기
     field_names = [f.name() for f in cadastral_layer.fields()]
-    pnu_field = None
-    for key in PNU_KEYS:
-        for fn in field_names:
-            if fn.strip().lower() == key.lower():
-                pnu_field = fn
-                break
-        if pnu_field:
-            break
-    if pnu_field is None:
-        for fn in field_names:
-            if "pnu" in fn.lower() or "고유번호" in fn:
-                pnu_field = fn
-                break
+    pnu_field = _layer_pnu_field(cadastral_layer)
     if pnu_field is None:
         log(f"⚠ 지적도에서 PNU 필드를 찾지 못했습니다. 필드={field_names}")
         return 0
@@ -574,7 +662,7 @@ def main():
         summary.append((name, data_id, status, raw,
                         narrow.featureCount(), wide.featureCount()))
 
-    # ── 연속지적도 + 토지임야정보 CSV 조인 ──────────────────────
+    # ── 연속지적도 + 토지임야정보 조인 ──────────────────────────
     log("\n[연속지적도_전국 조회 + 토지임야정보 조인]")
     log("-" * 64)
     cad_name, cad_id = CADASTRAL
@@ -586,16 +674,41 @@ def main():
         log(f"     상태={status}  → 지적도 0개")
         summary.append((cad_name, cad_id, status, 0, 0, 0))
     else:
-        # 지적도에 실제로 존재하는 PNU만 CSV 에서 골라 읽도록 전달(대용량 대비)
-        need_pnus = set()
-        for f in feats:
-            p = _feat_pnu(f)
-            if p:
-                need_pnus.add(p)
-        columns, index, _ = load_land_csv(need_pnus)   # 토지임야정보 CSV 선택
-
         cad_wide = build_layer("연속지적도", feats, rect_4326, do_clip=CLIP_WIDE_TO_RECT)
         cad_narrow = build_layer("연속지적도", feats, boundary_4326, do_clip=True)
+
+        # 지적도 PNU 수집 (구역계 / 넓은영역)
+        wide_pnus = set(filter(None, (_feat_pnu(f) for f in feats)))
+        nf = _layer_pnu_field(cad_narrow)
+        narrow_pnus = set()
+        if nf:
+            for f in cad_narrow.getFeatures():
+                v = str(f[nf]).strip()
+                if v:
+                    narrow_pnus.add(v)
+
+        # 토지임야정보 조인 방식 선택
+        opts = ["V-World API 자동조회 (파일 불필요, 권장)",
+                "CSV 파일에서 조인 (넓은 영역/대용량)",
+                "조인 안 함"]
+        choice, ok = QInputDialog.getItem(
+            iface.mainWindow(), "토지임야정보 조인 방식",
+            (f"지적도 필지 수 → 구역계 {len(narrow_pnus)} / "
+             f"+{OFFSET_M/1000:.0f}km {len(wide_pnus)}\n"
+             "토지임야정보를 어떻게 붙일까요?"), opts, 0, False)
+
+        columns = index = None
+        if ok and choice.startswith("V-World API"):
+            target = wide_pnus
+            if len(wide_pnus) > LADFRL_MAX_PNU:
+                log(f"     ⚠ PNU {len(wide_pnus)}개 > 상한 {LADFRL_MAX_PNU} "
+                    f"→ 구역계 {len(narrow_pnus)}필지만 API 조회(넓은 영역은 CSV 권장)")
+                target = narrow_pnus
+            columns, index = build_ladfrl_index(target)
+        elif ok and choice.startswith("CSV"):
+            columns, index, _ = load_land_csv(wide_pnus)
+        else:
+            log("ℹ 토지임야정보 조인 생략")
 
         if columns and index:
             join_land_info(cad_wide, columns, index)
