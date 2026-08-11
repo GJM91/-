@@ -46,8 +46,10 @@ from qgis.core import (
     QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsWkbTypes,
     QgsJsonUtils, QgsField, QgsFeature, QgsVectorFileWriter,
     QgsPalLayerSettings, QgsVectorLayerSimpleLabeling,
+    QgsTextBackgroundSettings, QgsProperty, QgsUnitTypes,
 )
-from qgis.PyQt.QtCore import QVariant
+from qgis.PyQt.QtCore import QVariant, QSizeF
+from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import QInputDialog, QMessageBox, QFileDialog
 
 # ─────────────────────────────────────────────────────────────
@@ -110,17 +112,29 @@ REG_STYLE_FIELD = "uname"
 # 저장 좌표계 (요청: EPSG:5186 = Korea 2000 / 중부원점)
 OUTPUT_CRS = "EPSG:5186"
 
-# 도시계획시설 '도로' 라벨 표기식
-#  예) 중(국) 3-1 = grad_se앞자(중로→중) + (pmi_nam앞자 국지도로→국) + road_ty(류)-road_no(번호)
+# 도시계획시설 '도로' 라벨 표기식 (도면처럼 2줄 + 가운데 구분선)
+#   중(국)
+#   ──
+#   3-1
+#  = grad_se앞자(중로→중) + (pmi_nam앞자 국지도로→국) / 구분선 / road_ty(류)-road_no(번호)
 #  grad_se: 등급(광로/대로/중로/소로),  pmi_nam: 기능(주간선/보조간선/집산/국지도로)
-#  road_ty: 류(정수),  road_no: 노선번호(정수)
-#  ※ 두 줄로 표시하려면 ') ' 대신 " ') ' " 자리를 char(10) 로 바꾸세요.
+DIVIDER = "──"
 ROAD_LABEL_EXPR = (
     "CASE WHEN coalesce(\"grad_se\",'')<>'' THEN "
-    "left(\"grad_se\",1) || '(' || left(\"pmi_nam\",1) || ') ' || "
+    "left(\"grad_se\",1) || '(' || left(\"pmi_nam\",1) || ')' "
+    "|| char(10) || '" + DIVIDER + "' || char(10) || "
     "\"road_ty\" || '-' || \"road_no\" "
     "ELSE \"uname\" END"
 )
+
+# 도로 원(라벨 배경) 색: 대로/광로=빨강, 중로/소로=파랑, 도로아님=검정
+ROAD_COLOR_EXPR = (
+    "CASE WHEN coalesce(\"grad_se\",'')='' THEN '0,0,0' "
+    "WHEN left(\"grad_se\",1) IN ('대','광') THEN '255,0,0' "
+    "ELSE '0,0,255' END"
+)
+# 도로일 때만 원 배경 그림
+ROAD_DRAW_EXPR = "CASE WHEN coalesce(\"grad_se\",'')<>'' THEN 1 ELSE 0 END"
 
 # 연속지적도_전국 (국토관리 지역개발 > 토지 > 연속지적도_전국)
 CADASTRAL = ("연속지적도", "LP_PA_CBND_BUBUN")
@@ -781,8 +795,8 @@ def apply_qml(layer, style_dir, qml_rel):
     return ok
 
 
-def apply_labeling(layer, expr, is_expression=False, size=8.0):
-    """레이어에 라벨(uname 또는 표현식) 적용."""
+def apply_labeling(layer, expr, is_expression=False, size=8.0, road_style=False):
+    """레이어에 라벨 적용. road_style=True 면 도로 표기(등급색 원 배경 + 가운데선)."""
     st = QgsPalLayerSettings()
     st.fieldName = expr
     st.isExpression = bool(is_expression)
@@ -792,7 +806,46 @@ def apply_labeling(layer, expr, is_expression=False, size=8.0):
         pass
     fmt = st.format()
     fmt.setSize(size)
-    st.setFormat(fmt)
+
+    if road_style:
+        try:
+            # 여러 줄 가운데 정렬
+            try:
+                st.multilineAlign = QgsPalLayerSettings.MultiCenter
+            except Exception:
+                pass
+            # 선 위 라벨을 수평으로 배치
+            try:
+                st.placement = QgsPalLayerSettings.Horizontal
+            except Exception:
+                pass
+            # 원(circle) 배경: 흰 바탕 + 등급색 테두리
+            bg = fmt.background()
+            bg.setEnabled(True)
+            bg.setType(QgsTextBackgroundSettings.ShapeCircle)
+            bg.setSizeType(QgsTextBackgroundSettings.SizeBuffer)
+            bg.setSize(QSizeF(1.2, 1.2))
+            bg.setSizeUnit(QgsUnitTypes.RenderMillimeters)
+            bg.setFillColor(QColor(255, 255, 255))
+            bg.setStrokeWidth(0.4)
+            bg.setStrokeWidthUnit(QgsUnitTypes.RenderMillimeters)
+            fmt.setBackground(bg)
+            st.setFormat(fmt)
+            # 데이터 정의: 글자색/테두리색(등급별), 도로만 원 표시
+            dd = st.dataDefinedProperties()
+            dd.setProperty(QgsPalLayerSettings.Color,
+                           QgsProperty.fromExpression(ROAD_COLOR_EXPR))
+            dd.setProperty(QgsPalLayerSettings.ShapeStrokeColor,
+                           QgsProperty.fromExpression(ROAD_COLOR_EXPR))
+            dd.setProperty(QgsPalLayerSettings.ShapeDraw,
+                           QgsProperty.fromExpression(ROAD_DRAW_EXPR))
+            st.setDataDefinedProperties(dd)
+        except Exception as e:
+            log(f"     ⚠ 도로 라벨 스타일 일부 적용 실패: {e}")
+            st.setFormat(fmt)
+    else:
+        st.setFormat(fmt)
+
     layer.setLabeling(QgsVectorLayerSimpleLabeling(st))
     layer.setLabelsEnabled(True)
     layer.triggerRepaint()
@@ -823,7 +876,8 @@ def save_shp(layer, out_dir, base_name):
 
 
 def emit_shp(layer, disp_name, group, out_dir, style_dir, qml_rel, tag,
-             keep_names=None, label_expr=None, label_is_expr=False):
+             keep_names=None, label_expr=None, label_is_expr=False,
+             road_style=False):
     """레이어를 SHP(EPSG:5186) 로 저장 + 스타일/라벨 적용 + QML 사이드카 생성.
        out_dir 가 없으면 메모리 레이어에 스타일/라벨만 적용해 추가."""
     src = subset_layer(layer, keep_names, disp_name) if keep_names else layer
@@ -838,7 +892,7 @@ def emit_shp(layer, disp_name, group, out_dir, style_dir, qml_rel, tag,
 
     styled = apply_qml(added, style_dir, qml_rel)
     if label_expr:
-        apply_labeling(added, label_expr, label_is_expr)
+        apply_labeling(added, label_expr, label_is_expr, road_style=road_style)
 
     # 사이드카(.qml) 저장: 렌더러 + 라벨 포함 → SHP 열면 스타일·라벨 자동 적용
     if path and (styled or label_expr):
@@ -908,7 +962,8 @@ def main():
             continue
 
         # 라벨식 결정 ("ROAD" 는 도로 표기식으로 치환)
-        label_expr = ROAD_LABEL_EXPR if label_spec == "ROAD" else label_spec
+        is_road = (label_spec == "ROAD")
+        label_expr = ROAD_LABEL_EXPR if is_road else label_spec
 
         wide = build_layer(gname, feats, rect_4326, do_clip=CLIP_WIDE_TO_RECT)
         narrow = build_layer(gname, feats, boundary_4326, do_clip=True)
@@ -916,10 +971,12 @@ def main():
         if REG_STYLE_FIELD not in fns:
             log(f"     ⚠ '{REG_STYLE_FIELD}' 필드가 없어 스타일이 안 맞을 수 있음. 필드={fns}")
         emit_shp(narrow, gname, grp_narrow, out_dir, style_dir, qml_rel, "구역계",
-                 label_expr=label_expr, label_is_expr=label_is_expr)
+                 label_expr=label_expr, label_is_expr=label_is_expr,
+                 road_style=is_road)
         emit_shp(wide, gname, grp_wide, out_dir, style_dir, qml_rel,
                  f"{OFFSET_M/1000:.0f}km",
-                 label_expr=label_expr, label_is_expr=label_is_expr)
+                 label_expr=label_expr, label_is_expr=label_is_expr,
+                 road_style=is_road)
         log(f"     구역계 {narrow.featureCount()}개 / "
             f"+{OFFSET_M/1000:.0f}km {wide.featureCount()}개\n")
         summary.append((gname, ",".join(data_ids), "OK", len(feats),
