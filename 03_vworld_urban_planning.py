@@ -161,10 +161,24 @@ SPECIAL_FIELDS = [
 PNU_KEYS = ["pnu", "PNU", "고유번호", "필지고유번호", "pnu_cd", "A1"]
 
 # ─────────────────────────────────────────────────────────────
+# 로그: 콘솔 + 홈폴더 txt 에 "즉시" 기록(중간에 QGIS가 튕겨도 어디서 멈췄는지 남김)
 log_lines = []
+LOG_PATH = os.path.join(os.path.expanduser("~"), "vworld_도시계획_결과.txt")
+try:
+    _log_fp = open(LOG_PATH, "w", encoding="utf-8")
+except Exception:
+    _log_fp = None
+
+
 def log(s=""):
     print(s)
     log_lines.append(str(s))
+    if _log_fp:
+        try:
+            _log_fp.write(str(s) + "\n")
+            _log_fp.flush()
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────
@@ -885,10 +899,10 @@ def emit_shp(layer, disp_name, group, out_dir, style_dir, qml_rel, tag,
     if path:
         added = QgsVectorLayer(path, disp_name, "ogr")
         if not added.isValid():
-            added = src
+            added = src.clone()
     else:
-        added = src.clone() if keep_names else src
-        added.setName(disp_name)
+        added = src.clone()
+    added.setName(disp_name)
 
     styled = apply_qml(added, style_dir, qml_rel)
     if label_expr:
@@ -950,37 +964,40 @@ def main():
     log("\n[규제 주제도 (용도지역·용도지구·용도구역·도시계획시설)]")
     log("-" * 64)
     for gname, data_ids, qml_rel, label_spec, label_is_expr in REG_GROUPS:
-        feats, statuses = [], []
-        for did in data_ids:
-            st, fs = vworld_fetch(did, api_bbox)
-            statuses.append(f"{did}:{st}({len(fs)})")
-            feats.extend(fs)
-        log(f"● {gname}  [{', '.join(statuses)}]")
-        if not feats:
-            log("     → 데이터 0개\n")
-            summary.append((gname, ",".join(data_ids), "NONE", 0, 0, 0))
-            continue
+        try:
+            feats, statuses = [], []
+            for did in data_ids:
+                st, fs = vworld_fetch(did, api_bbox)
+                statuses.append(f"{did}:{st}({len(fs)})")
+                feats.extend(fs)
+            log(f"● {gname}  [{', '.join(statuses)}]")
+            if not feats:
+                log("     → 데이터 0개\n")
+                summary.append((gname, ",".join(data_ids), "NONE", 0, 0, 0))
+                continue
 
-        # 라벨식 결정 ("ROAD" 는 도로 표기식으로 치환)
-        is_road = (label_spec == "ROAD")
-        label_expr = ROAD_LABEL_EXPR if is_road else label_spec
+            # 라벨식 결정 ("ROAD" 는 도로 표기식으로 치환)
+            is_road = (label_spec == "ROAD")
+            label_expr = ROAD_LABEL_EXPR if is_road else label_spec
 
-        wide = build_layer(gname, feats, rect_4326, do_clip=CLIP_WIDE_TO_RECT)
-        narrow = build_layer(gname, feats, boundary_4326, do_clip=True)
-        fns = [f.name() for f in wide.fields()]
-        if REG_STYLE_FIELD not in fns:
-            log(f"     ⚠ '{REG_STYLE_FIELD}' 필드가 없어 스타일이 안 맞을 수 있음. 필드={fns}")
-        emit_shp(narrow, gname, grp_narrow, out_dir, style_dir, qml_rel, "구역계",
-                 label_expr=label_expr, label_is_expr=label_is_expr,
-                 road_style=is_road)
-        emit_shp(wide, gname, grp_wide, out_dir, style_dir, qml_rel,
-                 f"{OFFSET_M/1000:.0f}km",
-                 label_expr=label_expr, label_is_expr=label_is_expr,
-                 road_style=is_road)
-        log(f"     구역계 {narrow.featureCount()}개 / "
-            f"+{OFFSET_M/1000:.0f}km {wide.featureCount()}개\n")
-        summary.append((gname, ",".join(data_ids), "OK", len(feats),
-                        narrow.featureCount(), wide.featureCount()))
+            wide = build_layer(gname, feats, rect_4326, do_clip=CLIP_WIDE_TO_RECT)
+            narrow = build_layer(gname, feats, boundary_4326, do_clip=True)
+            fns = [f.name() for f in wide.fields()]
+            if REG_STYLE_FIELD not in fns:
+                log(f"     ⚠ '{REG_STYLE_FIELD}' 필드 없음 → 스타일이 안 맞을 수 있음. 필드={fns}")
+            emit_shp(narrow, gname, grp_narrow, out_dir, style_dir, qml_rel, "구역계",
+                     label_expr=label_expr, label_is_expr=label_is_expr,
+                     road_style=is_road)
+            emit_shp(wide, gname, grp_wide, out_dir, style_dir, qml_rel,
+                     f"{OFFSET_M/1000:.0f}km",
+                     label_expr=label_expr, label_is_expr=label_is_expr,
+                     road_style=is_road)
+            log(f"     구역계 {narrow.featureCount()}개 / "
+                f"+{OFFSET_M/1000:.0f}km {wide.featureCount()}개\n")
+            summary.append((gname, ",".join(data_ids), "OK", len(feats),
+                            narrow.featureCount(), wide.featureCount()))
+        except Exception as e:
+            log(f"     ⚠ [{gname}] 처리 중 오류 → 건너뜀: {e}")
 
     # ── 연속지적도 + 토지임야정보 조인 → 지목/소유구분/공시지가 스타일 ──
     log("\n[연속지적도 조회 + 토지임야정보 조인]")
@@ -1035,12 +1052,20 @@ def main():
         keep_cad = set(base_cad_fields) | {n for n, _, _ in SPECIAL_FIELDS}
 
         # 구역계/2km × (지목·소유구분·공시지가) 스타일별로 SHP + QML사이드카 생성
+        #  ※ 메모리 절약: 지역별로 필드 축소본을 "한 번만" 만들고 재사용
         for region_layer, group, tag in [
                 (cad_narrow, grp_narrow, "구역계"),
                 (cad_wide, grp_wide, f"{OFFSET_M/1000:.0f}km")]:
+            try:
+                sub = subset_layer(region_layer, keep_cad, f"{tag}_연속지적도")
+            except Exception as e:
+                log(f"     ⚠ 지적도 축소본 생성 실패({tag}): {e}")
+                sub = region_layer
             for disp, qml_rel in CAD_STYLES:
-                emit_shp(region_layer, disp, group,
-                         out_dir, style_dir, qml_rel, tag, keep_names=keep_cad)
+                try:
+                    emit_shp(sub, disp, group, out_dir, style_dir, qml_rel, tag)
+                except Exception as e:
+                    log(f"     ⚠ 지적도 스타일 저장 실패({tag}/{disp}): {e}")
 
         field_names = [f.name() for f in cad_wide.fields()]
         log(f"     상태={status}  원본 {raw}개 → 구역계 {cad_narrow.featureCount()}개 "
@@ -1072,4 +1097,16 @@ def main():
         log(f"\n⚠ 파일 저장 실패: {e}")
 
 
-main()
+# 어떤 오류로 중단되든 로그(홈폴더 vworld_도시계획_결과.txt)에 기록되도록 감쌈
+try:
+    main()
+except Exception:
+    import traceback
+    log("\n❌ 스크립트 오류로 중단됨:\n" + traceback.format_exc())
+finally:
+    try:
+        if _log_fp:
+            _log_fp.flush()
+            _log_fp.close()
+    except Exception:
+        pass
