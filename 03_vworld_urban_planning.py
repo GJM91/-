@@ -33,6 +33,7 @@ QGIS Python 콘솔에서 실행하는 스크립트입니다.
 """
 
 import os
+import re
 import csv
 import json
 import math
@@ -43,7 +44,7 @@ import urllib.request
 from qgis.core import (
     QgsProject, QgsVectorLayer, QgsRasterLayer, QgsGeometry, QgsRectangle,
     QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsWkbTypes,
-    QgsJsonUtils, QgsField,
+    QgsJsonUtils, QgsField, QgsVectorFileWriter,
 )
 from qgis.PyQt.QtCore import QVariant
 from qgis.PyQt.QtWidgets import QInputDialog, QMessageBox, QFileDialog
@@ -85,28 +86,44 @@ CLIP_WIDE_TO_RECT = True
 
 # ─────────────────────────────────────────────────────────────
 # 규제 주제도 (국토관리 지역개발 > 용도지역지구)
-#  표시이름, V-World 데이터ID
-#  ※ 이전 진단으로 확인된 항목들. 필요 시 아래에 계속 추가하면 됩니다.
+#  하나의 QML(uname 기준)로 스타일링하기 위해 카테고리별로 데이터ID를 묶습니다.
+#  (표시이름, [데이터ID들], QML 상대경로)
 # ─────────────────────────────────────────────────────────────
-REG_THEMES = [
-    ("용도지역_도시지역",     "LT_C_UQ111"),
-    ("용도지역_관리지역",     "LT_C_UQ112"),
-    ("용도지역_농림지역",     "LT_C_UQ113"),
-    ("용도지역_자연환경보전", "LT_C_UQ114"),
-    ("용도지구_경관지구",     "LT_C_UQ121"),
-    ("용도지구_고도지구",     "LT_C_UQ123"),
-    ("용도지구_방화지구",     "LT_C_UQ124"),
-    ("용도지구_방재지구",     "LT_C_UQ125"),
-    ("용도지구_보호지구",     "LT_C_UQ126"),
-    ("용도지구_취락지구",     "LT_C_UQ128"),
-    ("용도지구_개발진흥지구", "LT_C_UQ129"),
-    ("용도구역_개발제한등",   "LT_C_UD801"),
-    ("도시계획시설",          "LT_C_UPISUQ151"),
-    ("행정경계_읍면동",       "LT_C_ADEMD_INFO"),
+REG_GROUPS = [
+    ("용도지역", ["LT_C_UQ111", "LT_C_UQ112", "LT_C_UQ113", "LT_C_UQ114"],
+     "05_토지이용규제/5_1_용도지역_style.qml"),
+    ("용도지구", ["LT_C_UQ121", "LT_C_UQ123", "LT_C_UQ124", "LT_C_UQ125",
+                  "LT_C_UQ126", "LT_C_UQ128", "LT_C_UQ129"],
+     "05_토지이용규제/5_2_용도지구_style.qml"),
+    ("용도구역", ["LT_C_UD801"],
+     "05_토지이용규제/5_3_용도구역_style.qml"),
+    ("도시계획시설", ["LT_C_UPISUQ151"],
+     "05_토지이용규제/5_4_도시계획시설_style.qml"),
 ]
+
+# 용도지역지구 계열 스타일이 기준으로 삼는 필드명(모든 QML을 이 필드로 맞춰둠)
+REG_STYLE_FIELD = "uname"
 
 # 연속지적도_전국 (국토관리 지역개발 > 토지 > 연속지적도_전국)
 CADASTRAL = ("연속지적도", "LP_PA_CBND_BUBUN")
+
+# 구역계 스타일 QML
+BOUNDARY_STYLE_QML = "00_구역계/2_0_구역계_style.qml"
+
+# 지적도(토지임야정보) 스타일: (표시이름, QML상대경로)  ← 각각 별도 스타일 사본
+CAD_STYLES = [
+    ("연속지적도_지목",     "04_토지이용/4_2_지적도_지목_style.qml"),
+    ("연속지적도_소유구분", "04_토지이용/4_1_지적도_소유구분_style.qml"),
+    ("연속지적도_공시지가", "04_토지이용/4_3_지적도_공시지가_style.qml"),
+]
+
+# 스타일 QML 이 참조하는 "특수 필드" — 토지임야정보에서 이 이름으로 만들어 둡니다.
+#  (대상필드명, [원본컬럼 힌트], 자료형)  numeric=True 면 실수형
+SPECIAL_FIELDS = [
+    ("li_lndcgrC", ["lndcgr"],          False),  # 지목 코드 (QML: 4_2, 값 1~28)
+    ("li_poses_1", ["posesn", "poses"], False),  # 소유구분 코드 (QML: 4_1, 값 0~9)
+    ("공시지가",   ["pblntf", "공시"],   True),   # 개별공시지가 (QML: 4_3, 숫자)
+]
 
 # 지적도/CSV 에서 PNU(필지고유번호) 로 인식할 후보 컬럼명
 PNU_KEYS = ["pnu", "PNU", "고유번호", "필지고유번호", "pnu_cd", "A1"]
@@ -577,6 +594,16 @@ def _layer_pnu_field(layer):
     return None
 
 
+def _pick_src_col(columns, hints):
+    """columns 중 hints 를 포함하는 컬럼을 찾아 반환(이름/명 컬럼은 뒤로)."""
+    cands = [c for c in columns if any(h in c.lower() for h in hints)]
+    if not cands:
+        return None
+    code_first = [c for c in cands
+                  if not (c.lower().endswith("nm") or c.endswith("명"))]
+    return (code_first or cands)[0]
+
+
 def join_land_info(cadastral_layer, columns, index):
     if not columns or not index:
         return 0
@@ -602,6 +629,20 @@ def join_land_info(cadastral_layer, columns, index):
         col_to_field[col] = name
         new_fields.append(QgsField(name, QVariant.String))
 
+    # 스타일 QML 이 참조하는 특수 필드(li_lndcgrC / li_poses_1 / 공시지가) 준비
+    special = []   # (대상필드명, 원본컬럼, numeric)
+    for tgt, hints, numeric in SPECIAL_FIELDS:
+        src = _pick_src_col(columns, hints)
+        if not src:
+            log(f"     · 스타일필드 {tgt}: 원본컬럼 자동탐지 실패(힌트 {hints})")
+            continue
+        special.append((tgt, src, numeric))
+        log(f"     · 스타일필드 {tgt} ← 토지임야 '{src}'{' (숫자)' if numeric else ''}")
+        if tgt not in existing:
+            existing.add(tgt)
+            new_fields.append(
+                QgsField(tgt, QVariant.Double if numeric else QVariant.String))
+
     cadastral_layer.dataProvider().addAttributes(new_fields)
     cadastral_layer.updateFields()
 
@@ -615,6 +656,17 @@ def join_land_info(cadastral_layer, columns, index):
             continue
         for col, fld in col_to_field.items():
             f[fld] = row.get(col, "")
+        for tgt, src, numeric in special:
+            raw = str(row.get(src, "")).strip()
+            if numeric:
+                try:
+                    f[tgt] = float(raw) if raw != "" else None
+                except Exception:
+                    f[tgt] = None
+            else:
+                if raw.isdigit():      # 코드: 앞자리 0 제거 → QML 값(1,2,..)과 일치
+                    raw = str(int(raw))
+                f[tgt] = raw
         cadastral_layer.updateFeature(f)
         matched += 1
     cadastral_layer.commitChanges()
@@ -658,6 +710,77 @@ def add_to_group(group, lyr):
 
 
 # ─────────────────────────────────────────────────────────────
+# 8) 파일 저장 + 스타일(QML) 적용
+# ─────────────────────────────────────────────────────────────
+def _safe(name):
+    return re.sub(r'[\\/:*?"<>|]', "_", str(name)).strip()
+
+
+def choose_dir(title):
+    """폴더 선택 팝업. 취소하면 None."""
+    d = QFileDialog.getExistingDirectory(iface.mainWindow(), title,
+                                         os.path.expanduser("~"))
+    return d if d else None
+
+
+def save_layer_gpkg(layer, out_dir, base_name):
+    """레이어를 out_dir 에 GeoPackage(.gpkg) 로 저장. 반환: (경로, 레이어명) 또는 (None,None)."""
+    if not out_dir:
+        return None, None
+    lname = _safe(base_name)
+    path = os.path.join(out_dir, lname + ".gpkg")
+    opts = QgsVectorFileWriter.SaveVectorOptions()
+    opts.driverName = "GPKG"
+    opts.layerName = lname
+    opts.fileEncoding = "UTF-8"
+    opts.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteFile
+    ctx = QgsProject.instance().transformContext()
+    try:
+        res = QgsVectorFileWriter.writeAsVectorFormatV3(layer, path, ctx, opts)
+    except AttributeError:
+        res = QgsVectorFileWriter.writeAsVectorFormatV2(layer, path, ctx, opts)
+    err = res[0]
+    if err != QgsVectorFileWriter.NoError:
+        log(f"     ⚠ 파일 저장 실패({base_name}): {res}")
+        return None, None
+    return path, lname
+
+
+def load_gpkg_layer(path, lname, disp_name):
+    fl = QgsVectorLayer(f"{path}|layername={lname}", disp_name, "ogr")
+    return fl if fl.isValid() else None
+
+
+def apply_qml(layer, style_dir, qml_rel):
+    """style_dir/qml_rel 의 QML 스타일을 레이어에 적용."""
+    if not style_dir or not qml_rel:
+        return False
+    p = os.path.join(style_dir, qml_rel)
+    if not os.path.exists(p):
+        log(f"     ⚠ QML 없음: {qml_rel}")
+        return False
+    res = layer.loadNamedStyle(p)
+    ok = res[1] if isinstance(res, tuple) and len(res) >= 2 else True
+    layer.triggerRepaint()
+    if not ok:
+        log(f"     ⚠ 스타일 적용 실패: {qml_rel}")
+    return ok
+
+
+def emit_layer(layer, disp_name, group, out_dir, style_dir, qml_rel, tag):
+    """레이어를 (있으면) 파일로 저장 후, 스타일 적용하여 그룹에 추가."""
+    added = layer
+    path, lname = save_layer_gpkg(layer, out_dir, f"{tag}_{disp_name}")
+    if path:
+        fl = load_gpkg_layer(path, lname, disp_name)
+        if fl is not None:
+            added = fl
+    apply_qml(added, style_dir, qml_rel)
+    add_to_group(group, added)
+    return added
+
+
+# ─────────────────────────────────────────────────────────────
 # 메인
 # ─────────────────────────────────────────────────────────────
 def main():
@@ -683,44 +806,54 @@ def main():
     grp_narrow = root.insertGroup(0, "① 구역계 (대상지)")
     grp_wide = root.insertGroup(0, f"② 구역계 + {OFFSET_M/1000:.0f}km")
 
-    add_basemap(grp_base)
-    add_to_group(grp_base, make_boundary_layer("범위_구역계", boundary_4326, "구역계"))
-    add_to_group(grp_base, make_boundary_layer(
-        f"범위_{OFFSET_M/1000:.0f}km사각형", rect_4326, f"{OFFSET_M/1000:.0f}km 오프셋"))
+    # 저장 폴더 / 스타일(QML) 폴더 선택 팝업 (취소하면 각각 생략)
+    out_dir = choose_dir("결과 파일을 저장할 폴더 선택 (취소하면 저장 안 함)")
+    log("■ 저장 폴더  : " + (out_dir or "(저장 안 함 · 메모리 레이어)"))
+    style_dir = choose_dir("스타일(QML) 폴더 선택 = '스타일 적용' 폴더 (취소하면 스타일 생략)")
+    log("■ 스타일 폴더: " + (style_dir or "(스타일 생략)"))
 
-    # 규제 주제도는 넓은 범위(2km 사각형)로 한 번만 조회한 뒤,
-    # ① 구역계 / ② 사각형 두 벌로 각각 클립하여 배치합니다.
-    log("\n[규제 주제도 조회 (용도지역지구·도시계획시설 등)]")
-    log("-" * 64)
+    add_basemap(grp_base)
+    bnd = make_boundary_layer("범위_구역계", boundary_4326, "구역계")
+    emit_layer(bnd, "범위_구역계", grp_base, out_dir, style_dir, BOUNDARY_STYLE_QML, "범위")
+    rct = make_boundary_layer(f"범위_{OFFSET_M/1000:.0f}km사각형", rect_4326, "2km")
+    emit_layer(rct, f"범위_{OFFSET_M/1000:.0f}km사각형", grp_base,
+               out_dir, style_dir, None, "범위")
+
     summary = []
-    for name, data_id in REG_THEMES:
-        log(f"● {name}  (data={data_id})")
-        status, feats = vworld_fetch(data_id, api_bbox)
-        raw = len(feats)
+
+    # ── 규제 주제도: 카테고리별 묶음 조회 → uname 기준 QML 적용 ──
+    log("\n[규제 주제도 (용도지역·용도지구·용도구역·도시계획시설)]")
+    log("-" * 64)
+    for gname, data_ids, qml_rel in REG_GROUPS:
+        feats, statuses = [], []
+        for did in data_ids:
+            st, fs = vworld_fetch(did, api_bbox)
+            statuses.append(f"{did}:{st}({len(fs)})")
+            feats.extend(fs)
+        log(f"● {gname}  [{', '.join(statuses)}]")
         if not feats:
-            log(f"     상태={status}  → 데이터 0개\n")
-            summary.append((name, data_id, status, 0, 0, 0))
+            log("     → 데이터 0개\n")
+            summary.append((gname, ",".join(data_ids), "NONE", 0, 0, 0))
             continue
 
-        wide = build_layer(f"{name}", feats, rect_4326, do_clip=CLIP_WIDE_TO_RECT)
-        narrow = build_layer(f"{name}", feats, boundary_4326, do_clip=True)
-        add_to_group(grp_wide, wide)
-        add_to_group(grp_narrow, narrow)
-
-        field_names = [f.name() for f in wide.fields()]
-        log(f"     상태={status}  원본 {raw}개 → 구역계 {narrow.featureCount()}개 "
-            f"/ +{OFFSET_M/1000:.0f}km {wide.featureCount()}개")
-        log(f"     필드: {field_names}")
-        log("")
-        summary.append((name, data_id, status, raw,
+        wide = build_layer(gname, feats, rect_4326, do_clip=CLIP_WIDE_TO_RECT)
+        narrow = build_layer(gname, feats, boundary_4326, do_clip=True)
+        fns = [f.name() for f in wide.fields()]
+        if REG_STYLE_FIELD not in fns:
+            log(f"     ⚠ '{REG_STYLE_FIELD}' 필드가 없어 스타일이 안 맞을 수 있음. 필드={fns}")
+        emit_layer(narrow, gname, grp_narrow, out_dir, style_dir, qml_rel, "구역계")
+        emit_layer(wide, gname, grp_wide, out_dir, style_dir, qml_rel,
+                   f"{OFFSET_M/1000:.0f}km")
+        log(f"     구역계 {narrow.featureCount()}개 / "
+            f"+{OFFSET_M/1000:.0f}km {wide.featureCount()}개\n")
+        summary.append((gname, ",".join(data_ids), "OK", len(feats),
                         narrow.featureCount(), wide.featureCount()))
 
-    # ── 연속지적도 + 토지임야정보 조인 ──────────────────────────
-    log("\n[연속지적도_전국 조회 + 토지임야정보 조인]")
+    # ── 연속지적도 + 토지임야정보 조인 → 지목/소유구분/공시지가 스타일 ──
+    log("\n[연속지적도 조회 + 토지임야정보 조인]")
     log("-" * 64)
     cad_name, cad_id = CADASTRAL
     log(f"● {cad_name}  (data={cad_id})")
-    # 연속지적도는 필지가 조밀 → 타일 분할로 전체 수집
     status, feats = vworld_fetch_tiled(cad_id, api_bbox)
     raw = len(feats)
     if not feats:
@@ -730,7 +863,6 @@ def main():
         cad_wide = build_layer("연속지적도", feats, rect_4326, do_clip=CLIP_WIDE_TO_RECT)
         cad_narrow = build_layer("연속지적도", feats, boundary_4326, do_clip=True)
 
-        # 지적도 PNU 수집 (구역계 / 넓은영역)
         wide_pnus = set(filter(None, (_feat_pnu(f) for f in feats)))
         nf = _layer_pnu_field(cad_narrow)
         narrow_pnus = set()
@@ -740,7 +872,6 @@ def main():
                 if v:
                     narrow_pnus.add(v)
 
-        # 토지임야정보 조인 방식 선택
         opts = ["V-World API 자동조회 (파일 불필요, 권장)",
                 "CSV 파일에서 조인 (넓은 영역/대용량)",
                 "조인 안 함"]
@@ -752,7 +883,6 @@ def main():
 
         columns = index = None
         if ok and choice.startswith("V-World API"):
-            # 항상 전체(2km 포함) 필지에 조인. 필지가 많으면 시간 안내만 하고 진행.
             if len(wide_pnus) > LADFRL_MAX_PNU:
                 log(f"     ⚠ 필지 {len(wide_pnus)}개 → API 호출이 많아 시간이 걸릴 수 "
                     f"있습니다(넓은 영역은 CSV 방식이 더 빠름). 전체를 조회합니다.")
@@ -766,8 +896,21 @@ def main():
             join_land_info(cad_wide, columns, index)
             join_land_info(cad_narrow, columns, index)
 
-        add_to_group(grp_wide, cad_wide)
-        add_to_group(grp_narrow, cad_narrow)
+        # 구역계/2km 각각: 파일 1회 저장 후, 지목·소유구분·공시지가 스타일 사본 생성
+        for region_layer, group, tag in [
+                (cad_narrow, grp_narrow, "구역계"),
+                (cad_wide, grp_wide, f"{OFFSET_M/1000:.0f}km")]:
+            path, lname = save_layer_gpkg(region_layer, out_dir, f"{tag}_연속지적도")
+            for disp, qml_rel in CAD_STYLES:
+                name = f"{tag}_{disp}"
+                if path:
+                    src = load_gpkg_layer(path, lname, name) or region_layer.clone()
+                    src.setName(name)
+                else:
+                    src = region_layer.clone()
+                    src.setName(name)
+                apply_qml(src, style_dir, qml_rel)
+                add_to_group(group, src)
 
         field_names = [f.name() for f in cad_wide.fields()]
         log(f"     상태={status}  원본 {raw}개 → 구역계 {cad_narrow.featureCount()}개 "
@@ -784,11 +927,15 @@ def main():
             f"원본={raw}, 구역계={n_narrow}, +{OFFSET_M/1000:.0f}km={n_wide}")
 
     # ── 결과 txt 저장 ───────────────────────────────────────
-    out_path = os.path.join(os.path.expanduser("~"), "vworld_도시계획_결과.txt")
+    log_dir = out_dir or os.path.expanduser("~")
+    out_path = os.path.join(log_dir, "vworld_도시계획_결과.txt")
     try:
         with open(out_path, "w", encoding="utf-8") as fp:
             fp.write("\n".join(log_lines))
-        msg = f"추출이 완료되었습니다.\n\n결과 로그: {out_path}"
+        msg = "추출이 완료되었습니다.\n\n"
+        msg += ("저장 폴더: " + out_dir if out_dir
+                else "파일 저장은 생략(메모리 레이어)") + "\n"
+        msg += "결과 로그: " + out_path
         log("\n✔ " + msg)
         QMessageBox.information(iface.mainWindow(), "추출 완료", msg)
     except Exception as e:
