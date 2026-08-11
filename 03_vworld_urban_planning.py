@@ -260,11 +260,17 @@ def vworld_fetch_tiled(data_id, bbox):
     any_ok = False
     err_seen = None
     for i, tb in enumerate(tiles, 1):
+        # 일시적 네트워크 오류로 타일이 통째로 빠지는 것을 막기 위해 재시도
         status, feats = vworld_fetch(data_id, tb)
+        for _retry in range(2):
+            if status != "NETERR":
+                break
+            status, feats = vworld_fetch(data_id, tb)
         if status == "OK":
             any_ok = True
         elif status in ("ERROR", "NETERR"):
             err_seen = status
+            log(f"       ⚠ 타일 {i} 조회 실패(status={status}) → 이 칸은 건너뜀")
         for f in feats:
             merged[_feat_key(f)] = f
         if i % 20 == 0 or i == len(tiles):
