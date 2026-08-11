@@ -235,12 +235,21 @@ def _subdivide_bbox_deg(bbox, tile_m):
     return tiles
 
 
-def _feat_key(feat):
-    """타일 경계 중복 제거용 고유키 (PNU → feature id → 지오메트리)."""
+def _feat_pnu(feat):
+    """GeoJSON feature 에서 PNU(필지고유번호) 문자열 추출 (없으면 None)."""
     props = feat.get("properties", {}) or {}
     for k in ("pnu", "PNU", "고유번호", "필지고유번호"):
-        if props.get(k):
-            return str(props[k])
+        v = props.get(k)
+        if v not in (None, ""):
+            return str(v).strip()
+    return None
+
+
+def _feat_key(feat):
+    """타일 경계 중복 제거용 고유키 (PNU → feature id → 지오메트리)."""
+    pnu = _feat_pnu(feat)
+    if pnu:
+        return pnu
     if feat.get("id"):
         return str(feat["id"])
     return json.dumps(feat.get("geometry", {}), sort_keys=True)[:256]
@@ -338,66 +347,76 @@ def _find_pnu_col(header):
     return None
 
 
-def load_land_csv():
-    """반환: (columns, index, pnu_col) 또는 (None, None, None)"""
+def load_land_csv(needed_pnus=None):
+    """토지임야정보 CSV(공공데이터포털 국가중점데이터)를 읽어 PNU→속성 dict 생성.
+       needed_pnus 가 주어지면 지적도에 실제로 있는 PNU 행만 골라 읽어(메모리 절약)
+       전국 단위 대용량 CSV 도 처리 가능.
+       반환: (columns, index, pnu_col) 또는 (None, None, None)"""
     path, _ = QFileDialog.getOpenFileName(
         iface.mainWindow(),
-        "토지임야정보 CSV 선택 (취소하면 조인 생략)",
+        "토지임야정보 CSV 선택 (공공데이터포털 다운로드 · 취소하면 조인 생략)",
         os.path.expanduser("~"), "CSV 파일 (*.csv);;모든 파일 (*.*)")
     if not path:
         log("ℹ 토지임야정보 CSV 미선택 → 지적도 조인 생략")
         return None, None, None
 
-    # 인코딩 자동 감지
-    text = None
+    # 인코딩 자동 감지 (앞부분만 시험적으로 읽어 판별)
+    used_enc = None
     for enc in ("cp949", "euc-kr", "utf-8-sig", "utf-8"):
         try:
             with open(path, "r", encoding=enc, newline="") as fp:
-                text = fp.read()
+                fp.read(8192)
             used_enc = enc
             break
         except Exception:
             continue
-    if text is None:
+    if used_enc is None:
         log(f"⚠ CSV 인코딩을 읽지 못했습니다: {path}")
         return None, None, None
 
     # 구분자 감지 (기본 콤마)
-    sample = text[:4096]
     delim = ","
     try:
+        with open(path, "r", encoding=used_enc, newline="") as fp:
+            sample = fp.read(4096)
         delim = csv.Sniffer().sniff(sample, delimiters=",\t;|").delimiter
     except Exception:
         pass
 
-    reader = csv.reader(text.splitlines(), delimiter=delim)
-    rows = list(reader)
-    if not rows:
-        log("⚠ CSV 내용이 비어 있습니다.")
-        return None, None, None
-
-    header = rows[0]
-    pnu_col = _find_pnu_col(header)
-    if pnu_col is None:
-        log(f"⚠ CSV 에서 PNU 컬럼을 찾지 못했습니다. 헤더={header}")
-        return None, None, None
-
-    pnu_idx = header.index(pnu_col)
-    columns = [h for i, h in enumerate(header) if i != pnu_idx]
-
+    # 대용량 대비: 파일을 통째로 올리지 않고 한 줄씩 스트리밍하며
+    # 지적도에 있는 PNU(needed_pnus)만 골라 담는다.
     index = {}
-    for r in rows[1:]:
-        if len(r) <= pnu_idx:
-            continue
-        pnu = str(r[pnu_idx]).strip()
-        if not pnu:
-            continue
-        index[pnu] = {header[i]: (r[i] if i < len(r) else "")
-                      for i in range(len(header)) if i != pnu_idx}
+    columns = None
+    pnu_col = None
+    pnu_idx = None
+    total = 0
+    with open(path, "r", encoding=used_enc, newline="") as fp:
+        reader = csv.reader(fp, delimiter=delim)
+        for row in reader:
+            if pnu_idx is None:
+                header = row
+                pnu_col = _find_pnu_col(header)
+                if pnu_col is None:
+                    log(f"⚠ CSV 에서 PNU 컬럼을 찾지 못했습니다. 헤더={header}")
+                    return None, None, None
+                pnu_idx = header.index(pnu_col)
+                columns = [h for i, h in enumerate(header) if i != pnu_idx]
+                continue
+            total += 1
+            if len(row) <= pnu_idx:
+                continue
+            pnu = str(row[pnu_idx]).strip()
+            if not pnu:
+                continue
+            if needed_pnus is not None and pnu not in needed_pnus:
+                continue
+            index[pnu] = {header[i]: (row[i] if i < len(row) else "")
+                          for i in range(len(header)) if i != pnu_idx}
 
+    scope = "지적도 매칭행만" if needed_pnus is not None else "전체행"
     log(f"✔ 토지임야정보 CSV 로드: {os.path.basename(path)} "
         f"(enc={used_enc}, 구분자='{delim}', PNU컬럼='{pnu_col}', "
-        f"행={len(index)}개, 속성열={len(columns)}개)")
+        f"전체 {total}행 중 {scope} {len(index)}개, 속성열={len(columns)}개)")
     return columns, index, pnu_col
 
 
@@ -567,7 +586,13 @@ def main():
         log(f"     상태={status}  → 지적도 0개")
         summary.append((cad_name, cad_id, status, 0, 0, 0))
     else:
-        columns, index, _ = load_land_csv()   # 토지임야정보 CSV 선택
+        # 지적도에 실제로 존재하는 PNU만 CSV 에서 골라 읽도록 전달(대용량 대비)
+        need_pnus = set()
+        for f in feats:
+            p = _feat_pnu(f)
+            if p:
+                need_pnus.add(p)
+        columns, index, _ = load_land_csv(need_pnus)   # 토지임야정보 CSV 선택
 
         cad_wide = build_layer("연속지적도", feats, rect_4326, do_clip=CLIP_WIDE_TO_RECT)
         cad_narrow = build_layer("연속지적도", feats, boundary_4326, do_clip=True)
