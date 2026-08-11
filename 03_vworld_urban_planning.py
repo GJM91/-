@@ -111,13 +111,14 @@ REG_STYLE_FIELD = "uname"
 OUTPUT_CRS = "EPSG:5186"
 
 # 도시계획시설 '도로' 라벨 표기식
-#  예) 중(주)1-26 = 등급앞자(중) + (기능앞자 주) + 류(grad_se 숫자) - 번호(pmi_nam 숫자)
-#  grad_se: 등급(광/대/중/소)+류,  pmi_nam: 기능(주간선/보조간선/집산/국지)+번호
+#  예) 중(국) 3-1 = grad_se앞자(중로→중) + (pmi_nam앞자 국지도로→국) + road_ty(류)-road_no(번호)
+#  grad_se: 등급(광로/대로/중로/소로),  pmi_nam: 기능(주간선/보조간선/집산/국지도로)
+#  road_ty: 류(정수),  road_no: 노선번호(정수)
+#  ※ 두 줄로 표시하려면 ') ' 대신 " ') ' " 자리를 char(10) 로 바꾸세요.
 ROAD_LABEL_EXPR = (
     "CASE WHEN coalesce(\"grad_se\",'')<>'' THEN "
-    "left(\"grad_se\",1) || '(' || left(\"pmi_nam\",1) || ')' || "
-    "coalesce(regexp_substr(\"grad_se\",'[0-9]+'),'') || '-' || "
-    "coalesce(regexp_substr(\"pmi_nam\",'[0-9]+'),'') "
+    "left(\"grad_se\",1) || '(' || left(\"pmi_nam\",1) || ') ' || "
+    "\"road_ty\" || '-' || \"road_no\" "
     "ELSE \"uname\" END"
 )
 
