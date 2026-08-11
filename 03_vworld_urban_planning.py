@@ -38,7 +38,6 @@ import csv
 import json
 import math
 import time
-import shutil
 import urllib.parse
 import urllib.request
 
@@ -46,6 +45,7 @@ from qgis.core import (
     QgsProject, QgsVectorLayer, QgsRasterLayer, QgsGeometry, QgsRectangle,
     QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsWkbTypes,
     QgsJsonUtils, QgsField, QgsFeature, QgsVectorFileWriter,
+    QgsPalLayerSettings, QgsVectorLayerSimpleLabeling,
 )
 from qgis.PyQt.QtCore import QVariant
 from qgis.PyQt.QtWidgets import QInputDialog, QMessageBox, QFileDialog
@@ -90,20 +90,36 @@ CLIP_WIDE_TO_RECT = True
 #  하나의 QML(uname 기준)로 스타일링하기 위해 카테고리별로 데이터ID를 묶습니다.
 #  (표시이름, [데이터ID들], QML 상대경로)
 # ─────────────────────────────────────────────────────────────
+# (표시이름, [데이터ID들], QML상대경로, 라벨식, 라벨식이 표현식인가)
+#  라벨식이 None 이면 라벨 표시 안 함.
 REG_GROUPS = [
     ("용도지역", ["LT_C_UQ111", "LT_C_UQ112", "LT_C_UQ113", "LT_C_UQ114"],
-     "05_토지이용규제/5_1_용도지역_style.qml"),
+     "05_토지이용규제/5_1_용도지역_style.qml", "uname", False),
     ("용도지구", ["LT_C_UQ121", "LT_C_UQ123", "LT_C_UQ124", "LT_C_UQ125",
                   "LT_C_UQ126", "LT_C_UQ128", "LT_C_UQ129"],
-     "05_토지이용규제/5_2_용도지구_style.qml"),
+     "05_토지이용규제/5_2_용도지구_style.qml", "uname", False),
     ("용도구역", ["LT_C_UD801"],
-     "05_토지이용규제/5_3_용도구역_style.qml"),
+     "05_토지이용규제/5_3_용도구역_style.qml", None, False),
     ("도시계획시설", ["LT_C_UPISUQ151"],
-     "05_토지이용규제/5_4_도시계획시설_style.qml"),
+     "05_토지이용규제/5_4_도시계획시설_style.qml", "ROAD", True),
 ]
 
 # 용도지역지구 계열 스타일이 기준으로 삼는 필드명(모든 QML을 이 필드로 맞춰둠)
 REG_STYLE_FIELD = "uname"
+
+# 저장 좌표계 (요청: EPSG:5186 = Korea 2000 / 중부원점)
+OUTPUT_CRS = "EPSG:5186"
+
+# 도시계획시설 '도로' 라벨 표기식
+#  예) 중(주)1-26 = 등급앞자(중) + (기능앞자 주) + 류(grad_se 숫자) - 번호(pmi_nam 숫자)
+#  grad_se: 등급(광/대/중/소)+류,  pmi_nam: 기능(주간선/보조간선/집산/국지)+번호
+ROAD_LABEL_EXPR = (
+    "CASE WHEN coalesce(\"grad_se\",'')<>'' THEN "
+    "left(\"grad_se\",1) || '(' || left(\"pmi_nam\",1) || ')' || "
+    "coalesce(regexp_substr(\"grad_se\",'[0-9]+'),'') || '-' || "
+    "coalesce(regexp_substr(\"pmi_nam\",'[0-9]+'),'') "
+    "ELSE \"uname\" END"
+)
 
 # 연속지적도_전국 (국토관리 지역개발 > 토지 > 연속지적도_전국)
 CADASTRAL = ("연속지적도", "LP_PA_CBND_BUBUN")
@@ -123,7 +139,7 @@ CAD_STYLES = [
 SPECIAL_FIELDS = [
     ("li_lndcgrC", ["lndcgr"],          False),  # 지목 코드 (QML: 4_2, 값 1~28)
     ("li_poses_1", ["posesn", "poses"], False),  # 소유구분 코드 (QML: 4_1, 값 0~9)
-    ("gongsi",     ["pblntf", "공시"],   True),   # 개별공시지가 (QML: 4_3, 숫자·ASCII)
+    ("jiga",       ["pblntf", "공시"],   True),   # 개별공시지가 (QML: 4_3, 숫자·ASCII)
 ]
 
 # 지적도/CSV 에서 PNU(필지고유번호) 로 인식할 후보 컬럼명
@@ -764,8 +780,25 @@ def apply_qml(layer, style_dir, qml_rel):
     return ok
 
 
+def apply_labeling(layer, expr, is_expression=False, size=8.0):
+    """레이어에 라벨(uname 또는 표현식) 적용."""
+    st = QgsPalLayerSettings()
+    st.fieldName = expr
+    st.isExpression = bool(is_expression)
+    try:
+        st.enabled = True
+    except Exception:
+        pass
+    fmt = st.format()
+    fmt.setSize(size)
+    st.setFormat(fmt)
+    layer.setLabeling(QgsVectorLayerSimpleLabeling(st))
+    layer.setLabelsEnabled(True)
+    layer.triggerRepaint()
+
+
 def save_shp(layer, out_dir, base_name):
-    """레이어를 out_dir 에 ESRI Shapefile 로 저장. 반환: .shp 경로 또는 None."""
+    """레이어를 out_dir 에 ESRI Shapefile(EPSG:5186) 로 저장. 반환: .shp 경로 또는 None."""
     if not out_dir:
         return None
     path = os.path.join(out_dir, _safe(base_name) + ".shp")
@@ -773,7 +806,11 @@ def save_shp(layer, out_dir, base_name):
     opts.driverName = "ESRI Shapefile"
     opts.fileEncoding = "UTF-8"
     opts.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteFile
+    # 저장 좌표계를 EPSG:5186 으로 변환
+    dst = QgsCoordinateReferenceSystem(OUTPUT_CRS)
     ctx = QgsProject.instance().transformContext()
+    if dst.isValid() and layer.crs() != dst:
+        opts.ct = QgsCoordinateTransform(layer.crs(), dst, ctx)
     try:
         res = QgsVectorFileWriter.writeAsVectorFormatV3(layer, path, ctx, opts)
     except AttributeError:
@@ -785,29 +822,30 @@ def save_shp(layer, out_dir, base_name):
 
 
 def emit_shp(layer, disp_name, group, out_dir, style_dir, qml_rel, tag,
-             keep_names=None):
-    """레이어를 SHP 로 저장 + QML 사이드카 생성 + 스타일 적용하여 그룹에 추가.
-       out_dir 가 없으면 메모리 레이어에 스타일만 적용해 추가."""
+             keep_names=None, label_expr=None, label_is_expr=False):
+    """레이어를 SHP(EPSG:5186) 로 저장 + 스타일/라벨 적용 + QML 사이드카 생성.
+       out_dir 가 없으면 메모리 레이어에 스타일/라벨만 적용해 추가."""
     src = subset_layer(layer, keep_names, disp_name) if keep_names else layer
     path = save_shp(src, out_dir, f"{tag}_{disp_name}")
     if path:
         added = QgsVectorLayer(path, disp_name, "ogr")
         if not added.isValid():
             added = src
-        # QML 사이드카(같은 이름 .qml) 복사 → 나중에 열기만 해도 스타일 적용됨
-        if style_dir and qml_rel:
-            qsrc = os.path.join(style_dir, qml_rel)
-            if os.path.exists(qsrc):
-                try:
-                    shutil.copyfile(qsrc, path[:-4] + ".qml")
-                except Exception as e:
-                    log(f"     ⚠ QML 사이드카 저장 실패: {e}")
-            else:
-                log(f"     ⚠ QML 없음: {qml_rel}")
     else:
         added = src.clone() if keep_names else src
         added.setName(disp_name)
-    apply_qml(added, style_dir, qml_rel)
+
+    styled = apply_qml(added, style_dir, qml_rel)
+    if label_expr:
+        apply_labeling(added, label_expr, label_is_expr)
+
+    # 사이드카(.qml) 저장: 렌더러 + 라벨 포함 → SHP 열면 스타일·라벨 자동 적용
+    if path and (styled or label_expr):
+        try:
+            added.saveNamedStyle(path[:-4] + ".qml")
+        except Exception as e:
+            log(f"     ⚠ QML 사이드카 저장 실패: {e}")
+
     add_to_group(group, added)
     return added
 
@@ -856,7 +894,7 @@ def main():
     # ── 규제 주제도: 카테고리별 묶음 조회 → uname 기준 QML 적용 ──
     log("\n[규제 주제도 (용도지역·용도지구·용도구역·도시계획시설)]")
     log("-" * 64)
-    for gname, data_ids, qml_rel in REG_GROUPS:
+    for gname, data_ids, qml_rel, label_spec, label_is_expr in REG_GROUPS:
         feats, statuses = [], []
         for did in data_ids:
             st, fs = vworld_fetch(did, api_bbox)
@@ -868,14 +906,19 @@ def main():
             summary.append((gname, ",".join(data_ids), "NONE", 0, 0, 0))
             continue
 
+        # 라벨식 결정 ("ROAD" 는 도로 표기식으로 치환)
+        label_expr = ROAD_LABEL_EXPR if label_spec == "ROAD" else label_spec
+
         wide = build_layer(gname, feats, rect_4326, do_clip=CLIP_WIDE_TO_RECT)
         narrow = build_layer(gname, feats, boundary_4326, do_clip=True)
         fns = [f.name() for f in wide.fields()]
         if REG_STYLE_FIELD not in fns:
             log(f"     ⚠ '{REG_STYLE_FIELD}' 필드가 없어 스타일이 안 맞을 수 있음. 필드={fns}")
-        emit_shp(narrow, gname, grp_narrow, out_dir, style_dir, qml_rel, "구역계")
+        emit_shp(narrow, gname, grp_narrow, out_dir, style_dir, qml_rel, "구역계",
+                 label_expr=label_expr, label_is_expr=label_is_expr)
         emit_shp(wide, gname, grp_wide, out_dir, style_dir, qml_rel,
-                 f"{OFFSET_M/1000:.0f}km")
+                 f"{OFFSET_M/1000:.0f}km",
+                 label_expr=label_expr, label_is_expr=label_is_expr)
         log(f"     구역계 {narrow.featureCount()}개 / "
             f"+{OFFSET_M/1000:.0f}km {wide.featureCount()}개\n")
         summary.append((gname, ",".join(data_ids), "OK", len(feats),
