@@ -38,13 +38,14 @@ import csv
 import json
 import math
 import time
+import shutil
 import urllib.parse
 import urllib.request
 
 from qgis.core import (
     QgsProject, QgsVectorLayer, QgsRasterLayer, QgsGeometry, QgsRectangle,
     QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsWkbTypes,
-    QgsJsonUtils, QgsField, QgsVectorFileWriter,
+    QgsJsonUtils, QgsField, QgsFeature, QgsVectorFileWriter,
 )
 from qgis.PyQt.QtCore import QVariant
 from qgis.PyQt.QtWidgets import QInputDialog, QMessageBox, QFileDialog
@@ -122,7 +123,7 @@ CAD_STYLES = [
 SPECIAL_FIELDS = [
     ("li_lndcgrC", ["lndcgr"],          False),  # 지목 코드 (QML: 4_2, 값 1~28)
     ("li_poses_1", ["posesn", "poses"], False),  # 소유구분 코드 (QML: 4_1, 값 0~9)
-    ("공시지가",   ["pblntf", "공시"],   True),   # 개별공시지가 (QML: 4_3, 숫자)
+    ("gongsi",     ["pblntf", "공시"],   True),   # 개별공시지가 (QML: 4_3, 숫자·ASCII)
 ]
 
 # 지적도/CSV 에서 PNU(필지고유번호) 로 인식할 후보 컬럼명
@@ -710,7 +711,9 @@ def add_to_group(group, lyr):
 
 
 # ─────────────────────────────────────────────────────────────
-# 8) 파일 저장 + 스타일(QML) 적용
+# 8) 파일 저장(Shapefile) + 스타일(QML) 적용
+#    · 저장 시 같은 이름의 .qml 을 함께 만들어(사이드카) 두면,
+#      나중에 그 SHP 를 열기만 해도 스타일이 자동 적용됩니다.
 # ─────────────────────────────────────────────────────────────
 def _safe(name):
     return re.sub(r'[\\/:*?"<>|]', "_", str(name)).strip()
@@ -723,32 +726,26 @@ def choose_dir(title):
     return d if d else None
 
 
-def save_layer_gpkg(layer, out_dir, base_name):
-    """레이어를 out_dir 에 GeoPackage(.gpkg) 로 저장. 반환: (경로, 레이어명) 또는 (None,None)."""
-    if not out_dir:
-        return None, None
-    lname = _safe(base_name)
-    path = os.path.join(out_dir, lname + ".gpkg")
-    opts = QgsVectorFileWriter.SaveVectorOptions()
-    opts.driverName = "GPKG"
-    opts.layerName = lname
-    opts.fileEncoding = "UTF-8"
-    opts.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteFile
-    ctx = QgsProject.instance().transformContext()
-    try:
-        res = QgsVectorFileWriter.writeAsVectorFormatV3(layer, path, ctx, opts)
-    except AttributeError:
-        res = QgsVectorFileWriter.writeAsVectorFormatV2(layer, path, ctx, opts)
-    err = res[0]
-    if err != QgsVectorFileWriter.NoError:
-        log(f"     ⚠ 파일 저장 실패({base_name}): {res}")
-        return None, None
-    return path, lname
-
-
-def load_gpkg_layer(path, lname, disp_name):
-    fl = QgsVectorLayer(f"{path}|layername={lname}", disp_name, "ogr")
-    return fl if fl.isValid() else None
+def subset_layer(src, keep_names, disp_name):
+    """src 에서 keep_names 필드만 남긴 메모리 레이어 생성(지오메트리·CRS 유지).
+       SHP 의 10자 필드명 잘림/충돌로 스타일 필드가 깨지는 것을 방지."""
+    gtype = QgsWkbTypes.displayString(src.wkbType()) or "MultiPolygon"
+    mem = QgsVectorLayer(f"{gtype}?crs={src.crs().authid()}", disp_name, "memory")
+    dp = mem.dataProvider()
+    keep_fields = [f for f in src.fields() if f.name() in keep_names]
+    dp.addAttributes(keep_fields)
+    mem.updateFields()
+    names = [f.name() for f in keep_fields]
+    feats = []
+    for sf in src.getFeatures():
+        nf = QgsFeature(mem.fields())
+        nf.setGeometry(sf.geometry())
+        for n in names:
+            nf[n] = sf[n]
+        feats.append(nf)
+    dp.addFeatures(feats)
+    mem.updateExtents()
+    return mem
 
 
 def apply_qml(layer, style_dir, qml_rel):
@@ -767,14 +764,49 @@ def apply_qml(layer, style_dir, qml_rel):
     return ok
 
 
-def emit_layer(layer, disp_name, group, out_dir, style_dir, qml_rel, tag):
-    """레이어를 (있으면) 파일로 저장 후, 스타일 적용하여 그룹에 추가."""
-    added = layer
-    path, lname = save_layer_gpkg(layer, out_dir, f"{tag}_{disp_name}")
+def save_shp(layer, out_dir, base_name):
+    """레이어를 out_dir 에 ESRI Shapefile 로 저장. 반환: .shp 경로 또는 None."""
+    if not out_dir:
+        return None
+    path = os.path.join(out_dir, _safe(base_name) + ".shp")
+    opts = QgsVectorFileWriter.SaveVectorOptions()
+    opts.driverName = "ESRI Shapefile"
+    opts.fileEncoding = "UTF-8"
+    opts.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteFile
+    ctx = QgsProject.instance().transformContext()
+    try:
+        res = QgsVectorFileWriter.writeAsVectorFormatV3(layer, path, ctx, opts)
+    except AttributeError:
+        res = QgsVectorFileWriter.writeAsVectorFormatV2(layer, path, ctx, opts)
+    if res[0] != QgsVectorFileWriter.NoError:
+        log(f"     ⚠ SHP 저장 실패({base_name}): {res}")
+        return None
+    return path
+
+
+def emit_shp(layer, disp_name, group, out_dir, style_dir, qml_rel, tag,
+             keep_names=None):
+    """레이어를 SHP 로 저장 + QML 사이드카 생성 + 스타일 적용하여 그룹에 추가.
+       out_dir 가 없으면 메모리 레이어에 스타일만 적용해 추가."""
+    src = subset_layer(layer, keep_names, disp_name) if keep_names else layer
+    path = save_shp(src, out_dir, f"{tag}_{disp_name}")
     if path:
-        fl = load_gpkg_layer(path, lname, disp_name)
-        if fl is not None:
-            added = fl
+        added = QgsVectorLayer(path, disp_name, "ogr")
+        if not added.isValid():
+            added = src
+        # QML 사이드카(같은 이름 .qml) 복사 → 나중에 열기만 해도 스타일 적용됨
+        if style_dir and qml_rel:
+            qsrc = os.path.join(style_dir, qml_rel)
+            if os.path.exists(qsrc):
+                try:
+                    shutil.copyfile(qsrc, path[:-4] + ".qml")
+                except Exception as e:
+                    log(f"     ⚠ QML 사이드카 저장 실패: {e}")
+            else:
+                log(f"     ⚠ QML 없음: {qml_rel}")
+    else:
+        added = src.clone() if keep_names else src
+        added.setName(disp_name)
     apply_qml(added, style_dir, qml_rel)
     add_to_group(group, added)
     return added
@@ -814,10 +846,10 @@ def main():
 
     add_basemap(grp_base)
     bnd = make_boundary_layer("범위_구역계", boundary_4326, "구역계")
-    emit_layer(bnd, "범위_구역계", grp_base, out_dir, style_dir, BOUNDARY_STYLE_QML, "범위")
+    emit_shp(bnd, "범위_구역계", grp_base, out_dir, style_dir, BOUNDARY_STYLE_QML, "범위")
     rct = make_boundary_layer(f"범위_{OFFSET_M/1000:.0f}km사각형", rect_4326, "2km")
-    emit_layer(rct, f"범위_{OFFSET_M/1000:.0f}km사각형", grp_base,
-               out_dir, style_dir, None, "범위")
+    emit_shp(rct, f"범위_{OFFSET_M/1000:.0f}km사각형", grp_base,
+             out_dir, style_dir, None, "범위")
 
     summary = []
 
@@ -841,9 +873,9 @@ def main():
         fns = [f.name() for f in wide.fields()]
         if REG_STYLE_FIELD not in fns:
             log(f"     ⚠ '{REG_STYLE_FIELD}' 필드가 없어 스타일이 안 맞을 수 있음. 필드={fns}")
-        emit_layer(narrow, gname, grp_narrow, out_dir, style_dir, qml_rel, "구역계")
-        emit_layer(wide, gname, grp_wide, out_dir, style_dir, qml_rel,
-                   f"{OFFSET_M/1000:.0f}km")
+        emit_shp(narrow, gname, grp_narrow, out_dir, style_dir, qml_rel, "구역계")
+        emit_shp(wide, gname, grp_wide, out_dir, style_dir, qml_rel,
+                 f"{OFFSET_M/1000:.0f}km")
         log(f"     구역계 {narrow.featureCount()}개 / "
             f"+{OFFSET_M/1000:.0f}km {wide.featureCount()}개\n")
         summary.append((gname, ",".join(data_ids), "OK", len(feats),
@@ -862,6 +894,8 @@ def main():
     else:
         cad_wide = build_layer("연속지적도", feats, rect_4326, do_clip=CLIP_WIDE_TO_RECT)
         cad_narrow = build_layer("연속지적도", feats, boundary_4326, do_clip=True)
+        # 조인 전 원본 지적도 필드(짧은 영문) 기억 → SHP 저장 시 이것 + 스타일필드만 사용
+        base_cad_fields = [f.name() for f in cad_narrow.fields()]
 
         wide_pnus = set(filter(None, (_feat_pnu(f) for f in feats)))
         nf = _layer_pnu_field(cad_narrow)
@@ -896,21 +930,16 @@ def main():
             join_land_info(cad_wide, columns, index)
             join_land_info(cad_narrow, columns, index)
 
-        # 구역계/2km 각각: 파일 1회 저장 후, 지목·소유구분·공시지가 스타일 사본 생성
+        # SHP 저장에 사용할 필드 = 원본 지적도 필드 + 스타일 특수필드(짧고 유일한 이름)
+        keep_cad = set(base_cad_fields) | {n for n, _, _ in SPECIAL_FIELDS}
+
+        # 구역계/2km × (지목·소유구분·공시지가) 스타일별로 SHP + QML사이드카 생성
         for region_layer, group, tag in [
                 (cad_narrow, grp_narrow, "구역계"),
                 (cad_wide, grp_wide, f"{OFFSET_M/1000:.0f}km")]:
-            path, lname = save_layer_gpkg(region_layer, out_dir, f"{tag}_연속지적도")
             for disp, qml_rel in CAD_STYLES:
-                name = f"{tag}_{disp}"
-                if path:
-                    src = load_gpkg_layer(path, lname, name) or region_layer.clone()
-                    src.setName(name)
-                else:
-                    src = region_layer.clone()
-                    src.setName(name)
-                apply_qml(src, style_dir, qml_rel)
-                add_to_group(group, src)
+                emit_shp(region_layer, disp, group,
+                         out_dir, style_dir, qml_rel, tag, keep_names=keep_cad)
 
         field_names = [f.name() for f in cad_wide.fields()]
         log(f"     상태={status}  원본 {raw}개 → 구역계 {cad_narrow.featureCount()}개 "

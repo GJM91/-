@@ -146,13 +146,13 @@
   </elevation>
   <renderer-v2 symbollevels="0" forceraster="0" enableorderby="0" type="RuleRenderer" referencescale="-1">
     <rules key="{f8925eee-8aaa-4f62-844d-cab4fb6f1b29}">
-      <rule symbol="0" filter="&quot;공시지가&quot; >= 0 AND &quot;공시지가&quot; &lt; 240000.0" label="240천원 미만" key="{dcee9a43-1345-43b0-99d7-1d5689610bfd}"/>
-      <rule symbol="1" filter="&quot;공시지가&quot; >= 240000.0 AND &quot;공시지가&quot; &lt; 320000.0" label="240 ~ 320천원" key="{4cb85b49-72a6-4ed8-8cb2-ff3b5b711942}"/>
-      <rule symbol="2" filter="&quot;공시지가&quot; >= 320000.0 AND &quot;공시지가&quot; &lt; 400000.0" label="320 ~ 400천원" key="{0e707ceb-4105-470f-aaae-80a49160224d}"/>
-      <rule symbol="3" filter="&quot;공시지가&quot; >= 400000.0 AND &quot;공시지가&quot; &lt; 480000.0" label="400 ~ 480천원" key="{d6ff6c88-aef4-48ca-ba02-6ad16c154dc0}"/>
-      <rule symbol="4" filter="&quot;공시지가&quot; >= 480000.0 AND &quot;공시지가&quot; &lt; 560000.0" label="480 ~ 560천원" key="{54b49f35-da6e-42d1-aef4-e0ae9eb7f72a}"/>
-      <rule symbol="5" filter="&quot;공시지가&quot; >= 560000.0" label="560천원 이상" key="{2f98e8e0-54d1-4754-94c0-751f2dd205dc}"/>
-      <rule symbol="6" filter="&quot;공시지가&quot; is Null" label="정보없음" key="{cf3d6d53-9058-4d96-8ceb-39b4d3c878b7}"/>
+      <rule symbol="0" filter="&quot;gongsi&quot; >= 0 AND &quot;gongsi&quot; &lt; 240000.0" label="240천원 미만" key="{dcee9a43-1345-43b0-99d7-1d5689610bfd}"/>
+      <rule symbol="1" filter="&quot;gongsi&quot; >= 240000.0 AND &quot;gongsi&quot; &lt; 320000.0" label="240 ~ 320천원" key="{4cb85b49-72a6-4ed8-8cb2-ff3b5b711942}"/>
+      <rule symbol="2" filter="&quot;gongsi&quot; >= 320000.0 AND &quot;gongsi&quot; &lt; 400000.0" label="320 ~ 400천원" key="{0e707ceb-4105-470f-aaae-80a49160224d}"/>
+      <rule symbol="3" filter="&quot;gongsi&quot; >= 400000.0 AND &quot;gongsi&quot; &lt; 480000.0" label="400 ~ 480천원" key="{d6ff6c88-aef4-48ca-ba02-6ad16c154dc0}"/>
+      <rule symbol="4" filter="&quot;gongsi&quot; >= 480000.0 AND &quot;gongsi&quot; &lt; 560000.0" label="480 ~ 560천원" key="{54b49f35-da6e-42d1-aef4-e0ae9eb7f72a}"/>
+      <rule symbol="5" filter="&quot;gongsi&quot; >= 560000.0" label="560천원 이상" key="{2f98e8e0-54d1-4754-94c0-751f2dd205dc}"/>
+      <rule symbol="6" filter="&quot;gongsi&quot; is Null" label="정보없음" key="{cf3d6d53-9058-4d96-8ceb-39b4d3c878b7}"/>
     </rules>
     <symbols>
       <symbol clip_to_extent="1" name="0" alpha="1" frame_rate="10" is_animated="0" force_rhr="0" type="fill">
@@ -536,7 +536,7 @@
         </config>
       </editWidget>
     </field>
-    <field name="공시지가" configurationFlags="None">
+    <field name="gongsi" configurationFlags="None">
       <editWidget type="">
         <config>
           <Option/>
@@ -594,7 +594,7 @@
     <alias name="" index="18" field="도로접면"/>
     <alias name="" index="19" field="도로접면코드"/>
     <alias name="" index="20" field="과소부정형"/>
-    <alias name="" index="21" field="공시지가"/>
+    <alias name="" index="21" field="gongsi"/>
     <alias name="" index="22" field="Shape_Length"/>
     <alias name="" index="23" field="Shape_Area"/>
     <alias name="" index="24" field="위경도_x"/>
@@ -622,7 +622,7 @@
     <default applyOnUpdate="0" field="도로접면" expression=""/>
     <default applyOnUpdate="0" field="도로접면코드" expression=""/>
     <default applyOnUpdate="0" field="과소부정형" expression=""/>
-    <default applyOnUpdate="0" field="공시지가" expression=""/>
+    <default applyOnUpdate="0" field="gongsi" expression=""/>
     <default applyOnUpdate="0" field="Shape_Length" expression=""/>
     <default applyOnUpdate="0" field="Shape_Area" expression=""/>
     <default applyOnUpdate="0" field="위경도_x" expression=""/>
@@ -650,7 +650,7 @@
     <constraint notnull_strength="0" unique_strength="0" exp_strength="0" constraints="0" field="도로접면"/>
     <constraint notnull_strength="0" unique_strength="0" exp_strength="0" constraints="0" field="도로접면코드"/>
     <constraint notnull_strength="0" unique_strength="0" exp_strength="0" constraints="0" field="과소부정형"/>
-    <constraint notnull_strength="0" unique_strength="0" exp_strength="0" constraints="0" field="공시지가"/>
+    <constraint notnull_strength="0" unique_strength="0" exp_strength="0" constraints="0" field="gongsi"/>
     <constraint notnull_strength="0" unique_strength="0" exp_strength="0" constraints="0" field="Shape_Length"/>
     <constraint notnull_strength="0" unique_strength="0" exp_strength="0" constraints="0" field="Shape_Area"/>
     <constraint notnull_strength="0" unique_strength="0" exp_strength="0" constraints="0" field="위경도_x"/>
@@ -678,7 +678,7 @@
     <constraint exp="" desc="" field="도로접면"/>
     <constraint exp="" desc="" field="도로접면코드"/>
     <constraint exp="" desc="" field="과소부정형"/>
-    <constraint exp="" desc="" field="공시지가"/>
+    <constraint exp="" desc="" field="gongsi"/>
     <constraint exp="" desc="" field="Shape_Length"/>
     <constraint exp="" desc="" field="Shape_Area"/>
     <constraint exp="" desc="" field="위경도_x"/>
