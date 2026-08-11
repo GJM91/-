@@ -35,6 +35,7 @@ QGIS Python 콘솔에서 실행하는 스크립트입니다.
 import os
 import csv
 import json
+import math
 import urllib.parse
 import urllib.request
 
@@ -60,6 +61,13 @@ OFFSET_M = 2000
 #  - MAX_PAGES 는 무한루프 방지용 안전장치입니다(넉넉히).
 PAGE_SIZE = 1000
 MAX_PAGES = 1000
+
+# 연속지적도처럼 필지가 조밀한 레이어는 넓은 영역을 한 번에 요청하면
+# V-World 가 오류/빈응답을 주므로, 작은 타일로 쪼개서 요청한 뒤 합칩니다.
+#  - TILE_M  : 타일 한 변의 길이(미터). 작을수록 안전하지만 요청 수가 늘어남.
+#  - MAX_TILES : 요청 수 폭주 방지 안전장치.
+TILE_M = 700
+MAX_TILES = 4000
 
 # 광역(구역계+2km) 레이어도 사각형으로 잘라낼지 여부
 #  True  : 2km 사각형 경계에서 폴리곤을 잘라냄(요청대로 "사각형"으로)
@@ -204,6 +212,69 @@ def vworld_fetch(data_id, bbox):
         if len(feats) < PAGE_SIZE:
             break   # 마지막 페이지 → 전체 수집 완료
     return final_status, all_features
+
+
+def _subdivide_bbox_deg(bbox, tile_m):
+    """4326 BBOX 를 대략 tile_m(미터) 크기의 작은 사각형들로 분할."""
+    minx, miny, maxx, maxy = bbox
+    midlat = (miny + maxy) / 2.0
+    m_per_deg_lat = 111320.0
+    m_per_deg_lon = 111320.0 * max(0.1, math.cos(math.radians(midlat)))
+    step_x = tile_m / m_per_deg_lon
+    step_y = tile_m / m_per_deg_lat
+    ncols = max(1, int(math.ceil((maxx - minx) / step_x)))
+    nrows = max(1, int(math.ceil((maxy - miny) / step_y)))
+    tiles = []
+    for r in range(nrows):
+        for c in range(ncols):
+            x0 = minx + c * step_x
+            y0 = miny + r * step_y
+            x1 = min(maxx, x0 + step_x)
+            y1 = min(maxy, y0 + step_y)
+            tiles.append((x0, y0, x1, y1))
+    return tiles
+
+
+def _feat_key(feat):
+    """타일 경계 중복 제거용 고유키 (PNU → feature id → 지오메트리)."""
+    props = feat.get("properties", {}) or {}
+    for k in ("pnu", "PNU", "고유번호", "필지고유번호"):
+        if props.get(k):
+            return str(props[k])
+    if feat.get("id"):
+        return str(feat["id"])
+    return json.dumps(feat.get("geometry", {}), sort_keys=True)[:256]
+
+
+def vworld_fetch_tiled(data_id, bbox):
+    """조밀한 레이어(연속지적도 등)를 타일 단위로 전부 조회 후 병합.
+       반환: (status, features)"""
+    tiles = _subdivide_bbox_deg(bbox, TILE_M)
+    if len(tiles) > MAX_TILES:
+        log(f"     ⚠ 타일 {len(tiles)}개 → 상한 {MAX_TILES}개만 조회 "
+            f"(TILE_M 을 키우면 타일 수가 줄어듭니다)")
+        tiles = tiles[:MAX_TILES]
+    log(f"     조밀 레이어 → {len(tiles)}개 타일로 나눠 전체 조회합니다...")
+
+    merged = {}
+    any_ok = False
+    err_seen = None
+    for i, tb in enumerate(tiles, 1):
+        status, feats = vworld_fetch(data_id, tb)
+        if status == "OK":
+            any_ok = True
+        elif status in ("ERROR", "NETERR"):
+            err_seen = status
+        for f in feats:
+            merged[_feat_key(f)] = f
+        if i % 20 == 0 or i == len(tiles):
+            log(f"       진행 {i}/{len(tiles)} 타일 · 누적 {len(merged)}필지")
+
+    if merged:
+        status = "OK"
+    else:
+        status = err_seen or "NOT_FOUND"
+    return status, list(merged.values())
 
 
 # ─────────────────────────────────────────────────────────────
@@ -483,7 +554,8 @@ def main():
     log("-" * 64)
     cad_name, cad_id = CADASTRAL
     log(f"● {cad_name}  (data={cad_id})")
-    status, feats = vworld_fetch(cad_id, api_bbox)
+    # 연속지적도는 필지가 조밀 → 타일 분할로 전체 수집
+    status, feats = vworld_fetch_tiled(cad_id, api_bbox)
     raw = len(feats)
     if not feats:
         log(f"     상태={status}  → 지적도 0개")
